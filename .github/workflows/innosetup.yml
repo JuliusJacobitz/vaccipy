@@ -31,9 +31,5 @@ jobs:
           # Arguments to pass to Chocolatey
           args: install innosetup --install-arguments="'/DIR=innosetup'" --force
           # Docker image to use
-      - name: ad
-        run: dir
-      - name: dir innosetup
-        run: dir innosetup
       - name: Run innosetup
-        run: innosetup/ICSS.exe test1_script.iss
+        run: innosetup/ISCC.exe test1_script.iss
