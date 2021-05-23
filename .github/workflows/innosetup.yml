@@ -33,3 +33,11 @@ jobs:
           # Docker image to use
       - name: Run innosetup
         run: innosetup/ISCC.exe windows.iss
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v7 
+        with:
+          add: 'installers --force'
+          author_name: build_win_installer
+          message: "win installer"
+          remove: ''
