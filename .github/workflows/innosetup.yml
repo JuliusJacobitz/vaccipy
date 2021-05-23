@@ -32,4 +32,4 @@ jobs:
           args: install innosetup --install-arguments="'/DIR=innosetup'" --force
           # Docker image to use
       - name: Run innosetup
-        run: innosetup/ISCC.exe test1_script.iss
+        run: innosetup/ISCC.exe windowsA.iss
