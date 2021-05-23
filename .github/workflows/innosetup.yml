@@ -16,7 +16,7 @@ jobs:
   # This workflow contains a single job called "build"
   build:
     # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
@@ -29,8 +29,10 @@ jobs:
         uses: crazy-max/ghaction-chocolatey@v1.5.0
         with:
           # Arguments to pass to Chocolatey
-          args: install innosetup
+          args: install innosetup --install-arguments="'/DIR=innosetup'"
           # Docker image to use
 
+      - name: dir innosetup
+        run: dir innosetup
       - name: Run innosetup
-        run: icss test1_script.iss
+        run: innosetup/ICSS.exe test1_script.iss
