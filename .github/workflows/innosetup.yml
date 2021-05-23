@@ -29,10 +29,13 @@ jobs:
         uses: crazy-max/ghaction-chocolatey@v1.5.0
         with:
           # Arguments to pass to Chocolatey
-          args: install innosetup --install-arguments="'/DIR=innosetup'"
+          args: install innosetup
           # Docker image to use
 
       - name: dir innosetup
-        run: dir innosetup
+        run: | 
+          dir C:\Program Files
+          dir C:
+          dir C:\Program Files (x86)\Inno Setup 6
       - name: Run innosetup
-        run: innosetup/ICSS.exe test1_script.iss
+        run: C:\Program Files (x86)\Inno Setup 6\ICSS.exe test1_script.iss
