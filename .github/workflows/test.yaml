@@ -17,6 +17,4 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2.3.4
       - name: check
-        run: |
-        echo ${GITHUB_REF/refs\/tags\//}
-        echo "$(GITHUB_REF#refs/*/)"
+        run: $(echo ${GITHUB_REF:10})
