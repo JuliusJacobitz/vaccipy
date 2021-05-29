@@ -21,8 +21,7 @@ jobs:
         id: random-color-generator
       - name: Get color
         run: echo "The selected color is ${{ steps.random-color-generator.outputs.SELECTED_COLOR }}"
-
-        - name: Set selected ref
+      - name: Set selected ref
         run: '::set-output name=RELEASE_VERSION::$(echo ${GITHUB_REF:10})'
         id: version
       - name: Get version
