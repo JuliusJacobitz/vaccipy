@@ -2,7 +2,7 @@
 # Builds the application for windows and ubuntu and creates distributable. Then creates a new
 #   Github release with the tag name and uploads the distributables to the release.
 #   Runs only on "v*" tags like "v1.0.0".
-name: deploy
+name: test
 
 on:
   push:
@@ -16,5 +16,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v2.3.4
-      - name: check
-        run: $(echo ${GITHUB_REF:10})
+      - name: Set selected color
+        run: echo '::set-output name=SELECTED_COLOR::green'
+        id: random-color-generator
+      - name: Get color
+        run: echo "The selected color is ${{ steps.random-color-generator.outputs.SELECTED_COLOR }}"
+
+        - name: Set selected ref
+        run: '::set-output name=RELEASE_VERSION::$(echo ${GITHUB_REF:10})'
+        id: version
+      - name: Get version
+        run: echo "The selected version is ${{ steps.version.outputs.RELEASE_VERSION }}"
