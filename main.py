@@ -1,405 +1,437 @@
+#!/usr/bin/env python3
+
+import argparse
+import copy
 import json
 import os
-import platform
-import time
-from base64 import b64encode
-from datetime import datetime
 
-import requests
-from selenium.webdriver import ActionChains
-from selenium.webdriver import Chrome
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+try:
+    import readline
+except:
+    pass
 
-from tools.clog import CLogger
-from tools.utils import retry_on_failure
+from tools.its import ImpfterminService
+from tools.kontaktdaten import get_kontaktdaten, validate_kontaktdaten, ValidationError
+from tools.utils import create_missing_dirs, remove_prefix
+
+PATH = os.path.dirname(os.path.realpath(__file__))
 
 
-class ImpfterminService():
-    def __init__(self, code: str, plz: str, kontakt: dict):
-        self.code = str(code).upper()
-        self.splitted_code = self.code.split("-")
+def update_kontaktdaten_interactive(
+        known_kontaktdaten,
+        command,
+        filepath=None):
+    """
+    Interaktive Eingabe und anschließendes Abspeichern der Kontaktdaten.
 
-        self.plz = str(plz)
-        self.kontakt = kontakt
-        self.authorization = b64encode(bytes(f":{code}", encoding='utf-8')).decode("utf-8")
+    :param known_kontaktdaten: Bereits bekannte Kontaktdaten, die nicht mehr
+        abgefragt werden sollen.
+    :param command: Entweder "code" oder "search". Bestimmt, welche
+        Kontaktdaten überhaupt benötigt werden.
+    :param filepath: Pfad zur JSON-Datei zum Abspeichern der Kontaktdaten.
+        Default: data/kontaktdaten.json im aktuellen Ordner
+    :return: Dictionary mit Kontaktdaten
+    """
 
-        # Logging einstellen
-        self.log = CLogger("impfterminservice")
-        self.log.set_prefix(f"*{self.code[-4:]}")
+    assert (command in ["code", "search"])
 
-        # Session erstellen
-        self.s = requests.Session()
-        self.s.headers.update({
-            'Authorization': f'Basic {self.authorization}',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 11_2_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36',
-        })
+    # Werfe Fehler, falls die übergebenen Kontaktdaten bereits ungültig sind.
+    validate_kontaktdaten(known_kontaktdaten)
 
-        # Ausgewähltes Impfzentrum prüfen
-        self.verfuegbare_impfzentren = {}
-        self.impfzentrum = {}
-        self.domain = None
-        if not self.impfzentren_laden():
-            quit()
+    kontaktdaten = copy.deepcopy(known_kontaktdaten)
 
-        # Verfügbare Impfstoffe laden
-        self.verfuegbare_impfstoffe = {}
-        while not self.impfstoffe_laden():
-            self.log.warn("Erneuter Versuch in 60 Sekunden")
-            time.sleep(60)
+    with open(filepath, 'w', encoding='utf-8') as file:
+        if "plz_impfzentren" not in kontaktdaten:
+            print(
+                "Mit einem Code kann in mehreren Impfzentren gleichzeitig nach einem Termin gesucht werden.\n"
+                "Eine Übersicht über die Gruppierung der Impfzentren findest du hier:\n"
+                "https://github.com/iamnotturner/vaccipy/wiki/Ein-Code-fuer-mehrere-Impfzentren\n\n"
+                "Trage nun die PLZ deines Impfzentrums ein. Für mehrere Impfzentren die PLZ's kommagetrennt nacheinander.\n"
+                "Beispiel: 68163, 69124, 69469\n")
+            input_kontaktdaten_key(kontaktdaten,
+                                   ["plz_impfzentren"],
+                                   "> PLZ's der Impfzentren: ",
+                                   lambda x: list(set([plz.strip() for plz in x.split(",")])))
 
-        # Sonstige
-        self.terminpaar = None
-        self.qualifikationen = []
+        if "code" not in kontaktdaten and command == "search":
+            input_kontaktdaten_key(kontaktdaten, ["code"], "> Code: ")
 
-    @retry_on_failure()
-    def impfzentren_laden(self):
-        """Laden aller Impfzentren zum Abgleich der eingegebenen PLZ.
+        if "kontakt" not in kontaktdaten:
+            kontaktdaten["kontakt"] = {}
 
-        :return: bool
-        """
-        url = "https://www.impfterminservice.de/assets/static/impfzentren.json"
+        if "anrede" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "anrede"], "> Anrede (Frau/Herr/...): ")
 
-        res = self.s.get(url, timeout=15)
-        if res.ok:
-            # Antwort-JSON umformattieren für einfachere Handhabung
-            formattierte_impfzentren = {}
-            for bundesland, impfzentren in res.json().items():
-                for impfzentrum in impfzentren:
-                    formattierte_impfzentren[impfzentrum["PLZ"]] = impfzentrum
+        if "vorname" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "vorname"], "> Vorname: ")
 
-            self.verfuegbare_impfzentren = formattierte_impfzentren
-            self.log.info(f"{len(self.verfuegbare_impfzentren)} Impfzentren verfügbar")
+        if "nachname" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "nachname"], "> Nachname: ")
 
-            # Prüfen, ob Impfzentrum zur eingetragenen PLZ existiert
-            self.impfzentrum = self.verfuegbare_impfzentren.get(self.plz)
-            if self.impfzentrum:
-                self.domain = self.impfzentrum.get("URL")
-                self.log.info("'{}' in {} {} ausgewählt".format(
-                    self.impfzentrum.get("Zentrumsname").strip(),
-                    self.impfzentrum.get("PLZ"),
-                    self.impfzentrum.get("Ort")))
-                return True
-            else:
-                self.log.error(f"Kein Impfzentrum in PLZ {self.plz} verfügbar")
-        else:
-            self.log.error("Impfzentren können nicht geladen werden")
-        return False
+        if "strasse" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "strasse"], "> Strasse (ohne Hausnummer): ")
 
-    @retry_on_failure(1)
-    def impfstoffe_laden(self):
-        """Laden der verfügbaren Impstoff-Qualifikationen.
-        In der Regel gibt es 3 Qualifikationen, die je nach Altersgruppe verteilt werden.
+        if "hausnummer" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "hausnummer"], "> Hausnummer: ")
 
-        """
+        if "plz" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "plz"], "> PLZ des Wohnorts: ")
 
-        path = "assets/static/its/vaccination-list.json"
+        if "ort" not in kontaktdaten["kontakt"] and command == "search":
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "ort"], "> Wohnort: ")
 
-        res = self.s.get(self.domain + path, timeout=15)
-        if res.ok:
-            res_json = res.json()
-            self.log.info(f"{len(res_json)} Impfstoffe am Impfzentrum verfügbar")
+        if "phone" not in kontaktdaten["kontakt"]:
+            input_kontaktdaten_key(
+                kontaktdaten,
+                ["kontakt", "phone"],
+                "> Telefonnummer: +49",
+                lambda x: x if x.startswith("+49") else f"+49{remove_prefix(x, '0')}")
 
-            for impfstoff in res_json:
-                qualifikation = impfstoff.get("qualification")
-                name = impfstoff.get("name", "N/A")
-                alter = impfstoff.get("age")
-                intervall = impfstoff.get("interval")
-                self.verfuegbare_impfstoffe[qualifikation] = name
-                self.log.info(f"{qualifikation}: {name} --> Altersgruppe: {alter} --> Intervall: {intervall} Tage")
-            print(" ")
-            return True
+        if "notificationChannel" not in kontaktdaten["kontakt"]:
+            kontaktdaten["kontakt"]["notificationChannel"] = "email"
 
-        self.log.error("Keine Impfstoffe im ausgewählten Impfzentrum verfügbar")
-        return False
+        if "notificationReceiver" not in kontaktdaten["kontakt"]:
+            input_kontaktdaten_key(
+                kontaktdaten, ["kontakt", "notificationReceiver"], "> Mail: ")
 
-    @retry_on_failure()
-    def cookies_erneuern(self):
-        self.log.info("Browser-Cookies generieren")
+        json.dump(kontaktdaten, file, ensure_ascii=False, indent=4)
 
-        # Chromedriver anhand des OS auswählen
-        chromedriver = None
-        operating_system = platform.system().lower()
-        if 'linux' in operating_system:
-            chromedriver = "./tools/chromedriver/chromedriver-linux"
-        elif 'windows' in operating_system:
-            chromedriver = "./tools/chromedriver/chromedriver-windows.exe"
-        elif 'darwin' in operating_system:
-            if "arm" in platform.processor().lower():
-                chromedriver = "./tools/chromedriver/chromedriver-mac-m1"
-            else:
-                chromedriver = "./tools/chromedriver/chromedriver-mac-intel"
-
-        path = "impftermine/service?plz={}".format(self.plz)
-        with Chrome(chromedriver) as driver:
-            driver.get(self.domain + path)
-
-            # Klick auf "Auswahl bestätigen" im Cookies-Banner
-            # Warteraum-Support: Timeout auf 1 Stunde
-            button_xpath = ".//html/body/app-root/div/div/div/div[2]/div[2]/div/div[1]/a"
-            button = WebDriverWait(driver, 60*60).until(
-                EC.element_to_be_clickable((By.XPATH, button_xpath)))
-            action = ActionChains(driver)
-            action.move_to_element(button).click().perform()
-
-            # Klick auf "Vermittlungscode bereits vorhanden"
-            button_xpath = "/html/body/app-root/div/app-page-its-login/div/div/div[2]/app-its-login-user/" \
-                           "div/div/app-corona-vaccination/div[2]/div/div/label[1]/span"
-            button = WebDriverWait(driver, 1).until(
-                EC.element_to_be_clickable((By.XPATH, button_xpath)))
-            action = ActionChains(driver)
-            action.move_to_element(button).click().perform()
-
-            # Auswahl des ersten Code-Input-Feldes
-            input_xpath = "/html/body/app-root/div/app-page-its-login/div/div/div[2]/app-its-login-user/" \
-                          "div/div/app-corona-vaccination/div[3]/div/div/div/div[1]/app-corona-vaccination-yes/" \
-                          "form[1]/div[1]/label/app-ets-input-code/div/div[1]/label/input"
-            input_field = WebDriverWait(driver, 1).until(
-                EC.element_to_be_clickable((By.XPATH, input_xpath)))
-            action = ActionChains(driver)
-            action.move_to_element(input_field).click().perform()
-
-            # Code eintragen
-            input_field.send_keys(self.code)
-            time.sleep(.1)
-
-            # Klick auf "Termin suchen"
-            button_xpath = "/html/body/app-root/div/app-page-its-login/div/div/div[2]/app-its-login-user/" \
-                           "div/div/app-corona-vaccination/div[3]/div/div/div/div[1]/app-corona-vaccination-yes/" \
-                           "form[1]/div[2]/button"
-            button = WebDriverWait(driver, 1).until(
-                EC.element_to_be_clickable((By.XPATH, button_xpath)))
-            action = ActionChains(driver)
-            action.move_to_element(button).click().perform()
-
-            # Maus-Bewegung hinzufügen (nicht sichtbar)
-            action.move_by_offset(10, 20).perform()
-
-            # prüfen, ob Cookies gesetzt wurden und in Session übernehmen
-            try:
-                cookie = driver.get_cookie("bm_sz")
-                if cookie:
-                    self.s.cookies.clear()
-                    self.s.cookies.update({c['name']: c['value'] for c in driver.get_cookies()})
-                    self.log.info("Browser-Cookie generiert: *{}".format(cookie.get("value")[-6:]))
-                    return True
-                else:
-                    self.log.error("Cookies können nicht erstellt werden!")
-                    return False
-            except:
-                return False
-
-    @retry_on_failure()
-    def login(self):
-        """Einloggen mittels Code, um qualifizierte Impfstoffe zu erhalten.
-        Dieser Schritt ist wahrscheinlich nicht zwigend notwendig, aber schadet auch nicht.
-
-        :return: bool
-        """
-
-        path = f"rest/login?plz={self.plz}"
-
-        res = self.s.get(self.domain + path, timeout=15)
-        if res.ok:
-            # Checken, welche Impfstoffe für das Alter zur Verfügung stehen
-            self.qualifikationen = res.json().get("qualifikationen")
-            if self.qualifikationen:
-                zugewiesene_impfstoffe = " ".join(
-                    [self.verfuegbare_impfstoffe.get(q, "N/A")
-                     for q in self.qualifikationen])
-                self.log.info("Erfolgreich mit Code eingeloggt")
-                self.log.info(f"Qualifizierte Impfstoffe: {zugewiesene_impfstoffe}")
-                print(" ")
-
-                return True
-            else:
-                self.log.error("Keine qualifizierten Impfstoffe verfügbar!")
-        else:
-            self.log.error("Einloggen mit Code nicht möglich!")
-        return False
-
-    @retry_on_failure()
-    def terminsuche(self):
-        """Es wird nach einen verfügbaren Termin in der gewünschten PLZ gesucht.
-        Ausgewählt wird der erstbeste Termin (!).
-        Zurückgegeben wird das Ergebnis der Abfrage und der Status-Code.
-        Bei Status-Code > 400 müssen die Cookies erneuert werden.
-
-        Beispiel für ein Termin-Paar:
-
-        [{
-            'slotId': 'slot-56817da7-3f46-4f97-9868-30a6ddabcdef',
-            'begin': 1616999901000,
-            'bsnr': '005221080'
-        }, {
-            'slotId': 'slot-d29f5c22-384c-4928-922a-30a6ddabcdef',
-            'begin': 1623999901000,
-            'bsnr': '005221080'
-        }]
-
-        :return: bool, status-code
-        """
-
-        path = f"rest/suche/impfterminsuche?plz={self.plz}"
-
-        while True:
-            res = self.s.get(self.domain + path, timeout=15)
-            if not res.ok or 'Virtueller Warteraum des Impfterminservice' not in res.text:
-                break
-            self.log.info('Wartezimmer... zZz...')
-            time.sleep(30)
-
-        if res.ok:
-            res_json = res.json()
-            terminpaare = res_json.get("termine")
-            if terminpaare:
-                # Auswahl des erstbesten Terminpaares
-                self.terminpaar = terminpaare[0]
-                self.log.success("Terminpaar gefunden!")
-
-                for num, termin in enumerate(self.terminpaar, 1):
-                    ts = datetime.fromtimestamp(termin["begin"] / 1000).strftime('%d.%m.%Y um %H:%M Uhr')
-                    self.log.success(f"{num}. Termin: {ts}")
-                return True, 200
-            else:
-                self.log.info("Keine Termine verfügbar")
-        else:
-            self.log.error("Terminpaare können nicht geladen werden")
-        return False, res.status_code
-
-    @retry_on_failure()
-    def termin_buchen(self):
-        """Termin wird gebucht für die Kontaktdaten, die beim Starten des
-        Programms eingetragen oder aus der JSON-Datei importiert wurden.
-
-        :return: bool
-        """
-
-        path = "rest/buchung"
-
-        # Daten für Impftermin sammeln
-        data = {
-            "plz": self.plz,
-            "slots": [self.terminpaar[0].get("slotId"), self.terminpaar[1].get("slotId")],
-            "qualifikationen": self.qualifikationen,
-            "contact": self.kontakt
-        }
-
-        res = self.s.post(self.domain + path, json=data, timeout=15)
-        if res.status_code == 201:
-            self.log.success("Termin erfolgreich gebucht!")
-            return True
-        else:
-            data = res.json()
-            try:
-                error = data['errors']['status']
-            except KeyError:
-                error = ''
-            if 'nicht mehr verfügbar' in error:
-                self.log.error(f"Diesen Termin gibts nicht mehr: {error}")
-            else:
-                self.log.error(f"Termin konnte nicht gebucht werden: {data}")
-            return False
-
-    @staticmethod
-    def run(code: str, plz: str, kontakt: json, check_delay: int = 60):
-        """Workflow für die Terminbuchung.
-
-        :param code: 14-stelliger Impf-Code
-        :param plz: PLZ des Impfzentrums
-        :param kontakt: Kontaktdaten der zu impfenden Person als JSON
-        :param check_delay: Zeit zwischen Iterationen der Terminsuche
-        :return:
-        """
-
-        its = ImpfterminService(code, plz, kontakt)
-        its.cookies_erneuern()
-        while not its.login():
-            its.cookies_erneuern()
-            time.sleep(3)
-
-        while True:
-            termin_gefunden = False
-            while not termin_gefunden:
-                termin_gefunden, status_code = its.terminsuche()
-                if status_code >= 400:
-                    its.cookies_erneuern()
-                elif not termin_gefunden:
-                    time.sleep(check_delay)
-
-            if its.termin_buchen():
-                break
-            time.sleep(300)
+    return kontaktdaten
 
 
-def main():
-    print("vaccipy 1.0\n")
+def input_kontaktdaten_key(
+        kontaktdaten,
+        path,
+        prompt,
+        transformer=lambda x: x):
+    target = kontaktdaten
+    for key in path[:-1]:
+        target = target[key]
+    key = path[-1]
+    while True:
+        target[key] = transformer(input(prompt).strip())
+        try:
+            validate_kontaktdaten(kontaktdaten)
+            break
+        except ValidationError as exc:
+            print(f"\n{str(exc)}\n")
 
-    # Check, ob die Datei "kontaktdaten.json" existiert
-    kontaktdaten_erstellen = True
-    if os.path.isfile("kontaktdaten.json"):
-        daten_laden = input("Sollen die vorhandene Daten aus 'kontaktdaten.json' geladen werden (y/n)?: ").lower()
-        if daten_laden != "n":
-            kontaktdaten_erstellen = False
 
-    if kontaktdaten_erstellen:
-        print("Bitte trage zunächst deinen Impfcode und deine Kontaktdaten ein.\n"
-              "Die Daten werden anschließend lokal in der Datei 'kontaktdaten.json' abgelegt.\n"
-              "Du musst sie zukünftig nicht mehr eintragen.\n")
-        code = input("Code: ")
-        plz = input("PLZ des Impfzentrums: ")
+def run_search_interactive(kontaktdaten_path, check_delay):
+    """
+    Interaktives Setup für die Terminsuche:
+    1. Ggf. zuerst Eingabe, ob Kontaktdaten aus kontaktdaten.json geladen
+       werden sollen.
+    2. Laden der Kontaktdaten aus kontaktdaten.json.
+    3. Bei unvollständigen Kontaktdaten: Interaktive Eingabe der fehlenden
+       Kontaktdaten.
+    4. Terminsuche
 
-        anrede = input("Anrede (Frau/Herr/...): ")
-        vorname = input("Vorname: ")
-        nachname = input("Nachname: ")
-        strasse = input("Strasse: ")
-        hausnummer = input("Hausnummer: ")
-        wohnort_plz = input("PLZ des Wohnorts: ")
-        wohnort = input("Wohnort: ")
-        telefonnummer = input("Telefonnummer: ")
-        mail = input("Mail: ")
+    :param kontaktdaten_path: Pfad zur JSON-Datei mit Kontaktdaten. Default: data/kontaktdaten.json im aktuellen Ordner
+    """
 
-        kontakt = {
-            "anrede": anrede,
-            "vorname": vorname,
-            "nachname": nachname,
-            "strasse": strasse,
-            "hausnummer": hausnummer,
-            "plz": wohnort_plz,
-            "ort": wohnort,
-            "phone": "+49" + str(telefonnummer),
-            "notificationChannel": "email",
-            "notificationReceiver": mail,
-        }
+    print(
+        "Bitte trage zunächst deinen Impfcode und deine Kontaktdaten ein.\n"
+        f"Die Daten werden anschließend lokal in der Datei '{os.path.basename(kontaktdaten_path)}' abgelegt.\n"
+        "Du musst sie zukünftig nicht mehr eintragen.\n")
 
-        kontaktdaten = {
-            "code": code,
-            "plz": plz,
-            "kontakt": kontakt
-        }
+    kontaktdaten = {}
+    if os.path.isfile(kontaktdaten_path):
+        daten_laden = input(
+            f"> Sollen die vorhandenen Daten aus '{os.path.basename(kontaktdaten_path)}' geladen werden (y/n)?: ").lower()
+        if daten_laden.lower() != "n":
+            kontaktdaten = get_kontaktdaten(kontaktdaten_path)
 
-        with open('kontaktdaten.json', 'w', encoding='utf-8') as f:
-            json.dump(kontaktdaten, f, ensure_ascii=False, indent=4)
+    print()
+    kontaktdaten = update_kontaktdaten_interactive(
+        kontaktdaten, "search", kontaktdaten_path)
+    print()
+    return run_search(kontaktdaten, check_delay)
 
-    else:
-        with open("kontaktdaten.json") as f:
-            kontaktdaten = json.load(f)
+
+def run_search(kontaktdaten, check_delay):
+    """
+    Nicht-interaktive Terminsuche
+
+    :param kontaktdaten: Dictionary mit Kontaktdaten
+    """
 
     try:
         code = kontaktdaten["code"]
-        plz = kontaktdaten["plz"]
-        kontakt = kontaktdaten["kontakt"]
-        print(f"Kontaktdaten wurden geladen für: {kontakt['vorname']} {kontakt['nachname']}\n")
-    except KeyError as exc:
-        print("Kontaktdaten konnten nicht aus 'kontaktdaten.json' geladen werden.\n"
-              "Bitte überprüfe, ob sie im korrekten JSON-Format sind oder gebe "
-              "deine Daten beim Programmstart erneut ein.")
-        raise exc
 
-    ImpfterminService.run(code=code, plz=plz, kontakt=kontakt, check_delay=30)
-    
+        # Hinweis, wenn noch alte Version der Kontaktdaten.json verwendet wird
+        if kontaktdaten.get("plz"):
+            print(
+                "ACHTUNG: Du verwendest noch die alte Version der 'Kontaktdaten.json'!\n"
+                "Lösche vor dem nächsten Ausführen die Datei und fülle die Kontaktdaten bitte erneut aus.\n")
+            plz_impfzentren = [kontaktdaten.get("plz")]
+        else:
+            plz_impfzentren = kontaktdaten["plz_impfzentren"]
+
+        kontakt = kontaktdaten["kontakt"]
+        print(
+            f"Kontaktdaten wurden geladen für: {kontakt['vorname']} {kontakt['nachname']}\n")
+    except KeyError as exc:
+        raise ValueError(
+            "Kontaktdaten konnten nicht aus 'kontaktdaten.json' geladen werden.\n"
+            "Bitte überprüfe, ob sie im korrekten JSON-Format sind oder gebe "
+            "deine Daten beim Programmstart erneut ein.\n") from exc
+
+    ImpfterminService.terminsuche(code=code, plz_impfzentren=plz_impfzentren, kontakt=kontakt,
+                                  check_delay=check_delay,PATH=PATH)
+
+
+def gen_code_interactive(kontaktdaten_path):
+    """
+    Interaktives Setup für die Codegenerierung:
+    1. Ggf. zuerst Eingabe, ob Kontaktdaten aus kontaktdaten.json geladen
+       werden sollen.
+    2. Laden der Kontaktdaten aus kontaktdaten.json.
+    3. Bei unvollständigen Kontaktdaten: Interaktive Eingabe derjenigen
+       fehlenden Kontaktdaten, die für die Codegenerierung benötigt werden.
+    4. Codegenerierung
+
+    :param kontaktdaten_path: Pfad zur JSON-Datei mit Kontaktdaten. Default: kontaktdaten.json im aktuellen Ordner
+    """
+
+    print(
+        "Du kannst dir jetzt direkt einen Impf-Code erstellen.\n"
+        "Dazu benötigst du eine Mailadresse, Telefonnummer und die PLZ deines Impfzentrums.\n"
+        f"Die Daten werden anschließend lokal in der Datei '{os.path.basename(kontaktdaten_path)}' abgelegt.\n"
+        "Du musst sie zukünftig nicht mehr eintragen.\n")
+
+    kontaktdaten = {}
+    if os.path.isfile(kontaktdaten_path):
+        daten_laden = input(
+            f"> Sollen die vorhandenen Daten aus '{os.path.basename(kontaktdaten_path)}' geladen werden (y/n)?: ").lower()
+        if daten_laden.lower() != "n":
+            kontaktdaten = get_kontaktdaten(kontaktdaten_path)
+
+    print()
+    kontaktdaten = update_kontaktdaten_interactive(
+        kontaktdaten, "code", kontaktdaten_path)
+    print()
+    return gen_code(kontaktdaten)
+
+
+def gen_code(kontaktdaten):
+    """
+    Codegenerierung ohne interaktive Eingabe der Kontaktdaten
+
+    :param kontaktdaten: Dictionary mit Kontaktdaten
+    """
+
+    try:
+        plz_impfzentrum = kontaktdaten["plz_impfzentren"][0]
+        mail = kontaktdaten["kontakt"]["notificationReceiver"]
+        telefonnummer = kontaktdaten["kontakt"]["phone"]
+        if not telefonnummer.startswith("+49"):
+            telefonnummer = f"+49{remove_prefix(telefonnummer, '0')}"
+    except KeyError as exc:
+        raise ValueError(
+            "Kontaktdaten konnten nicht aus 'kontaktdaten.json' geladen werden.\n"
+            "Bitte überprüfe, ob sie im korrekten JSON-Format sind oder gebe "
+            "deine Daten beim Programmstart erneut ein.\n") from exc
+
+    its = ImpfterminService("PLAT-ZHAL-TER1", [plz_impfzentrum], {},PATH)
+
+    print("Wähle nachfolgend deine Altersgruppe aus (L920, L921, L922 oder L923).\n"
+          "Es ist wichtig, dass du die Gruppe entsprechend deines Alters wählst, "
+          "ansonsten wird dir der Termin vor Ort abesagt.\n"
+          "In den eckigen Klammern siehst du, welche Impfstoffe den Gruppe jeweils zugeordnet sind.\n"
+          "Beispiel: L921\n")
+
+    while True:
+        leistungsmerkmal = input("> Leistungsmerkmal: ").upper()
+        if leistungsmerkmal in ["L920", "L921", "L922", "L923"]:
+            break
+        print("Falscheingabe! Bitte erneut versuchen:")
+
+    # cookies erneuern und code anfordern
+    its.renew_cookies_code()
+    token = its.code_anfordern(mail, telefonnummer, plz_impfzentrum, leistungsmerkmal)
+
+    if token is not None:
+        # code bestätigen
+        print("\nDu erhälst gleich eine SMS mit einem Code zur Bestätigung deiner Telefonnummer.\n"
+              "Trage diesen hier ein. Solltest du dich vertippen, hast du noch 2 weitere Versuche.\n"
+              "Beispiel: 123-456\n")
+
+        # 3 Versuche für die SMS-Code-Eingabe
+        for _ in range(3):
+            sms_pin = input("> SMS-Code: ").replace("-", "")
+            if its.code_bestaetigen(token, sms_pin):
+                print("\nDu kannst jetzt mit der Terminsuche fortfahren.\n")
+                return True
+
+    print("\nDie Code-Generierung war leider nicht erfolgreich.\n")
+    return False
+
+
+def subcommand_search(args):
+    if args.configure_only:
+        update_kontaktdaten_interactive(
+            get_kontaktdaten(args.file), "search", args.file)
+    elif args.read_only:
+        run_search(get_kontaktdaten(args.file), check_delay=args.retry_sec)
+    else:
+        run_search_interactive(args.file, check_delay=args.retry_sec)
+
+
+def subcommand_code(args):
+    if args.configure_only:
+        update_kontaktdaten_interactive(
+            get_kontaktdaten(args.file), "code", args.file)
+    elif args.read_only:
+        gen_code(get_kontaktdaten(args.file))
+    else:
+        gen_code_interactive(args.file)
+
+
+def validate_args(args):
+    """
+    Raises ValueError if args contain invalid settings.
+    """
+
+    if args.configure_only and args.read_only:
+        raise ValueError("--configure-only und --read-only kann nicht gleichzeitig verwendet werden")
+
+
+def main():
+    create_missing_dirs()
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(help="commands", dest="command")
+
+    base_subparser = argparse.ArgumentParser(add_help=False)
+    base_subparser.add_argument(
+        "-f",
+        "--file",
+        help="Pfad zur JSON-Datei für Kontaktdaten")
+    base_subparser.add_argument(
+        "-c",
+        "--configure-only",
+        action='store_true',
+        help="Nur Kontaktdaten erfassen und in JSON-Datei abspeichern")
+    base_subparser.add_argument(
+        "-r",
+        "--read-only",
+        action='store_true',
+        help="Es wird nicht nach fehlenden Kontaktdaten gefragt. Stattdessen wird ein Fehler angezeigt, falls benötigte Kontaktdaten in der JSON-Datei fehlen.")
+
+    parser_search = subparsers.add_parser(
+        "search", parents=[base_subparser], help="Termin suchen")
+    parser_search.add_argument(
+        "-s",
+        "--retry-sec",
+        type=int,
+        default=60,
+        help="Wartezeit zwischen zwei Versuchen (in Sekunden)")
+
+    parser_code = subparsers.add_parser(
+        "code",
+        parents=[base_subparser],
+        help="Impf-Code generieren")
+
+    args = parser.parse_args()
+
+    if not hasattr(args, "file") or args.file is None:
+        args.file = os.path.join(PATH, "data/kontaktdaten.json")
+    if not hasattr(args, "configure_only"):
+        args.configure_only = False
+    if not hasattr(args, "read_only"):
+        args.read_only = False
+    if not hasattr(args, "retry_sec"):
+        args.retry_sec = 60
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+        # parser.error terminates the program with status code 2.
+
+    if args.command is not None:
+        try:
+            if args.command == "search":
+                subcommand_search(args)
+            elif args.command == "code":
+                subcommand_code(args)
+            else:
+                assert False
+        except ValidationError as exc:
+            print(f"Fehler in {json.dumps(args.file)}:\n{str(exc)}")
+
+    else:
+        extended_settings = False
+
+        while True:
+            print(
+                "Was möchtest du tun?\n"
+                "[1] Termin suchen\n"
+                "[2] Impf-Code generieren\n"
+                f"[x] Erweiterte Einstellungen {'verbergen' if extended_settings else 'anzeigen'}\n")
+
+            if extended_settings:
+                print(
+                    f"[c] --configure-only {'de' if args.configure_only else ''}aktivieren\n"
+                    f"[r] --read-only {'de' if args.read_only else ''}aktivieren\n"
+                    "[s] --retry-sec setzen\n")
+
+            option = input("> Option: ").lower()
+            print()
+
+            try:
+                if option == "1":
+                    subcommand_search(args)
+                elif option == "2":
+                    subcommand_code(args)
+                elif option == "x":
+                    extended_settings = not extended_settings
+                elif extended_settings and option == "c":
+                    new_args = copy.copy(args)
+                    new_args.configure_only = not new_args.configure_only
+                    validate_args(new_args)
+                    args = new_args
+                    print(
+                        f"--configure-only {'de' if not args.configure_only else ''}aktiviert.")
+                elif extended_settings and option == "r":
+                    new_args = copy.copy(args)
+                    new_args.read_only = not new_args.read_only
+                    validate_args(new_args)
+                    args = new_args
+                    print(
+                        f"--read-only {'de' if not args.read_only else ''}aktiviert.")
+                elif extended_settings and option == "s":
+                    args.retry_sec = int(input("> --retry-sec="))
+                else:
+                    print("Falscheingabe! Bitte erneut versuchen.")
+                print()
+            except Exception as exc:
+                print(f"\nFehler:\n{str(exc)}\n")
 
 
 if __name__ == "__main__":
+    print("""
+                                _                 
+                               (_)                
+ __   __   __ _    ___    ___   _   _ __    _   _ 
+ \ \ / /  / _` |  / __|  / __| | | | '_ \  | | | |
+  \ V /  | (_| | | (__  | (__  | | | |_) | | |_| |
+   \_/    \__,_|  \___|  \___| |_| | .__/   \__, |
+                                   | |       __/ |
+                                   |_|      |___/ 
+""")
+    print("Automatische Terminbuchung für den Corona Impfterminservice\n")
+
+    print("Vor der Ausführung des Programms ist die Berechtigung zur Impfung zu prüfen.\n"
+          "Ob Anspruch auf eine Impfung besteht, kann hier nachgelesen werden:\n"
+          "https://www.impfterminservice.de/terminservice/faq\n")
+
     main()

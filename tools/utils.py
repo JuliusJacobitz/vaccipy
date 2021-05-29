@@ -1,8 +1,12 @@
 import time
 import traceback
-from json import JSONDecodeError
+from pathlib import Path
 
-from requests.exceptions import ReadTimeout
+from threading import Thread
+from plyer import notification
+from tools.exceptions import DesktopNotificationError
+from json import JSONDecodeError
+from requests.exceptions import ReadTimeout, ConnectionError, ConnectTimeout
 
 
 def retry_on_failure(retries=10):
@@ -30,22 +34,29 @@ def retry_on_failure(retries=10):
 
                     self.log.error("Timeout exception raised", prefix=function.__name__)
 
-                    if function.__name__ != "cookies_erneuern":
-                        self.cookies_erneuern()
+                    if function.__name__ != "renew_cookies":
+                        self.renew_cookies()
+
+                except (ConnectTimeout, ConnectionError):
+                    # Keine Internetverbindung
+                    self.log.error("Connection exception | Es besteht keine Internetverbindung,"
+                                   "erneuter Versuch in 30 Sekunden",
+                                   prefix=function.__name__)
+                    time.sleep(30)
 
                 except JSONDecodeError:
                     # die API gibt eine nicht-JSON-Response,
                     # wenn die IP (temporär) gebannt ist, oder die Website
                     # sich im Wartungsmodus befindet
 
-                    self.log.error("JSON parsing error | IP gebannt oder Website down, "
+                    self.log.error("JSON parsing exception | IP gebannt oder Website down, "
                                    "erneuter Versuch in 30 Sekunden",
                                    prefix=function.__name__)
                     time.sleep(30)
 
                     # Cookies erneuern bei der Terminsuche
                     if function.__name__ == "terminsuche":
-                        self.cookies_erneuern()
+                        self.renew_cookies()
 
                 except Exception as e:
                     exc = type(e).__name__
@@ -62,3 +73,43 @@ def retry_on_failure(retries=10):
         return wrapper
 
     return retry_function
+
+
+def remove_prefix(text, prefix):
+    """
+    Entfernt einen gegebenen String vom Angang des Textes.
+    """
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+
+def desktop_notification(operating_system:str, title: str, message: str):
+        """
+        Starts a thread and creates a desktop notification using plyer.notification
+        """
+
+        if 'windows' not in operating_system:
+            return
+
+        try:
+            Thread(target=notification.notify(
+                app_name="Impfterminservice",
+                title=title,
+                message=message)
+            ).start()
+        except Exception as exc:
+            raise DesktopNotificationError(
+                "Error in _desktop_notification: " + str(exc.__class__.__name__)
+                + traceback.format_exc()
+                           ) from exc
+    
+def create_missing_dirs():
+    """
+    Erstellt benötigte Ordner, falls sie fehlen:
+
+    - ./data
+    """
+    Path("./data").mkdir(parents=True, exist_ok=True)
+
+        

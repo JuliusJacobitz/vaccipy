@@ -1,11 +1,20 @@
 .idea/
-.vscode/settings.json
+.vscode/
 __pycache__/
 
+*.DS_Store
+
+# log
+log/
 
 # data
-kontaktdaten.json 
+kontaktdaten.json
+
+#building: 
+installer/
 
 # pyinstaller 
 # temporary building files:
 build/    
+dist/
+
